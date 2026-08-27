@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Speech → Text → Speech</title>
+
+<!-- ==========================================================================
+     Live Speech → Text → Speech — single-file app (styles + markup + script).
+
+     All inference runs in the browser tab; this page is served as static
+     files only (see serve.py). Pipeline per utterance:
+
+       MicVAD (Silero VAD)  ->  Whisper STT  ->  Kokoro TTS  ->  playback
+       (mic capture & segmentation)  (transcribe)   (synthesize)  (AudioContext)
+
+     "Barge-in" support: any new detected speech bumps `S.runId` and stops
+     current playback, invalidating in-flight generation work.
+     ========================================================================== -->
+
+<style>
+/* ==========================================================================
+   1. Design tokens — dark theme palette and shared colors.
+   ========================================================================== */
+:root {
+  --bg: #0e1116;
+  --panel: #161b23;
+  --panel-2: #1d232e;
+  --text: #e6ebf2;
+  --muted: #8b97a8;
+  --accent: #4f8cff;
+  --accent-2: #2de0a7;
+  --danger: #ff5c6c;
+  --border: #262e3b;
+}
+
+/* ==========================================================================
+   2. Base layout — centered card on a soft radial gradient background.
+   ========================================================================== */
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(1200px 700px at 50% -10%, #1a2230 0%, var(--bg) 60%);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 24px;
+}
+.card {
+  width: 100%;
+  max-width: 460px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 32px 28px;
+  box-shadow: 0 24px 60px rgba(0,0,0,.5);
+}
+
+/* ==========================================================================
+   3. Header & status indicator — colored dot mirrors the state machine:
+      gray=offline, green=ready, blue=listening, amber=working, red=error.
+   ========================================================================== */
+h1 {
+  font-size: 15px;
+  letter-spacing: .28em;
+  text-align: center;
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-size: 13px;
+  letter-spacing: .12em;
+  color: var(--muted);
+  margin: 6px 0 26px;
+  text-transform: uppercase;
+}
+.dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--muted);
+  transition: background .2s, box-shadow .2s;
+}
+.dot.ready    { background: var(--accent-2); box-shadow: 0 0 0 5px rgba(45,224,167,.15); }
+.dot.listening{ background: var(--accent);   box-shadow: 0 0 0 5px rgba(79,140,255,.18); animation: pulse 1.1s infinite; }
+.dot.working  { background: #f0b429;         box-shadow: 0 0 0 5px rgba(240,180,41,.18); animation: pulse .7s infinite; }
+.dot.error    { background: var(--danger);   box-shadow: 0 0 0 5px rgba(255,92,108,.18); }
+@keyframes pulse { 50% { opacity: .45; } }
+
+/* ==========================================================================
+   4. Mic button — large round toggle; danger-red while listening.
+   ========================================================================== */
+.mic-wrap { display: flex; justify-content: center; margin-bottom: 26px; }
+.mic {
+  width: 92px; height: 92px; border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 34px;
+  cursor: pointer;
+  transition: transform .12s, background .2s, border-color .2s;
+  display: flex; align-items: center; justify-content: center;
+}
+.mic:hover { border-color: var(--accent); transform: scale(1.04); }
+.mic:disabled { opacity: .4; cursor: wait; }   /* While models are loading. */
+.mic.active { background: var(--danger); border-color: var(--danger); }
+
+/* ==========================================================================
+   5. Transcript panel & latency metric grid (STT / TTFA / TTS / TOTAL).
+   ========================================================================== */
+.transcript {
+  min-height: 58px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  font-size: 15px;
+  line-height: 1.5;
+  margin-bottom: 18px;
+  color: var(--muted);
+}
+.transcript .label { font-size: 11px; letter-spacing: .14em; color: var(--muted); text-transform: uppercase; }
+.transcript .text { color: var(--text); margin-top: 2px; }
+.transcript .nothing { color: var(--danger); font-style: italic; }
+
+.metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+.metric {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.metric .k { font-size: 11px; color: var(--muted); letter-spacing: .06em; }
+.metric .v { font-size: 16px; font-family: ui-monospace, "SF Mono", Consolas, monospace; margin-top: 3px; }
+
+/* ==========================================================================
+   6. Settings drawer — voice picker, sliders, TTS test row.
+   ========================================================================== */
+details { border: 1px solid var(--border); border-radius: 12px; padding: 4px 14px; }
+summary { cursor: pointer; font-size: 13px; color: var(--muted); padding: 10px 0; user-select: none; }
+.setting { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; }
+.setting label { font-size: 13px; color: var(--muted); }
+.setting input[type=range] { flex: 1; accent-color: var(--accent); }
+.setting .val { font-size: 12px; color: var(--text); min-width: 52px; text-align: right; font-family: ui-monospace, Consolas, monospace; }
+select {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; font-size: 13px;
+}
+.test-row { display: flex; gap: 8px; padding: 10px 0 14px; }
+.test-row input {
+  flex: 1; background: var(--panel-2); border: 1px solid var(--border);
+  color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 13px;
+}
+.test-row button {
+  background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+  padding: 0 16px; font-size: 13px; cursor: pointer;
+}
+.hint { font-size: 12px; color: var(--muted); margin-top: 16px; line-height: 1.5; text-align: center; }
+</style>
+</head>
+<body>
+<div class="card">
+
+  <!-- Header: title + live status dot/label -->
+  <h1>Live Speech → Text → Speech</h1>
+  <div class="status"><span id="dot" class="dot"></span><span id="status-text">OFFLINE</span></div>
+
+  <!-- Start/stop button. First click loads models (~500 MB, cached after). -->
+  <div class="mic-wrap">
+    <button id="mic" class="mic" title="Start / stop">▶</button>
+  </div>
+
+  <!-- Speech-to-text output -->
+  <div class="transcript">
+    <div class="label">You</div>
+    <div id="transcript" class="text">Press ▶ to start. Models download on first run (~500 MB, cached after).</div>
+  </div>
+
+  <!-- Latency measurements for the last utterance round-trip -->
+  <div class="metrics">
+    <div class="metric"><div class="k">STT</div><div id="m-stt" class="v">—</div></div>
+    <div class="metric"><div class="k">TTFA</div><div id="m-ttfa" class="v">—</div></div>
+    <div class="metric"><div class="k">TTS</div><div id="m-tts" class="v">—</div></div>
+    <div class="metric"><div class="k">TOTAL</div><div id="m-total" class="v">—</div></div>
+  </div>
+
+  <!-- Collapsible settings -->
+  <details>
+    <summary>Settings</summary>
+    <div class="setting">
+      <label for="voice">Voice</label>
+      <select id="voice"></select>
+    </div>
+    <div class="setting">
+      <label for="speed">Speed</label>
+      <input type="range" id="speed" min="0.5" max="2" step="0.1" value="1">
+      <span class="val" id="speed-val">1.0</span>
+    </div>
+    <div class="setting">
+      <label for="volume">Volume</label>
+      <input type="range" id="volume" min="0" max="100" step="1" value="70">
+      <span class="val" id="volume-val">70%</span>
+    </div>
+    <div class="setting">
+      <label for="silence">Silence</label>
+      <input type="range" id="silence" min="100" max="1000" step="50" value="150">
+      <span class="val" id="silence-val">150 ms</span>
+    </div>
+    <div class="test-row">
+      <input id="test-text" placeholder="Type text to test TTS…">
+      <button id="test-btn">Speak</button>
+    </div>
+  </details>
+
+  <div class="hint">
+    <div id="backend-label"></div>
+    All inference runs locally in this tab. Audio output device is controlled by your browser / OS.
+    Use headphones to avoid the mic picking up playback.
+  </div>
+</div>
+
+<!-- Dependencies pinned by version so upgrades are explicit decisions:
+     ort.js         -> shared onnxruntime-web instance (WebGPU/WASM backend)
+     vad-web bundle -> Silero VAD wrapper around mic capture -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/bundle.min.js"></script>
+
+<script type="module">
+import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0';
+import { KokoroTTS, TextSplitterStream, env as kokoroEnv } from 'https://esm.sh/kokoro-js@1.2.1';
+
+// Kokoro bundles transformers.js v3, whose WASM paths default to a URL that
+// 404s under esm.sh. Point it at onnxruntime-web's actual dist so the WASM
+// fallback works when WebGPU is unavailable.
+kokoroEnv.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250409-89f8206ba4/dist/';
+
+const $ = (id) => document.getElementById(id);
+
+/**
+ * Global app state. Models are loaded lazily on the first start click and
+ * CACHED HERE — stop/start no longer re-downloads or re-parses them.
+ */
+const S = {
+  device: 'wasm', dtype: 'q8',
+  transcriber: null, tts: null, vad: null,
+  player: null,
+  runId: 0,          // Bumped on barge-in/stop to invalidate in-flight async work.
+  started: false,
+  settings: { voice: 'am_adam', speed: 1.0, volume: 0.7, silenceMs: 150 },
+};
+
+/* ==========================================================================
+   1. Status UI — one tiny helper per concern, used everywhere below.
+   ========================================================================== */
+
+/** Set the status pill label + dot color (`kind` maps to a .dot-* CSS class). */
+function setStatus(text, kind) {
+  $('status-text').textContent = text;
+  const dot = $('dot');
+  dot.className = 'dot ' + (kind || '');
+}
+
+/** Set an amber pulsing status; optional progress percentage. */
+function setLoading(msg) { setStatus(msg || 'LOADING', 'working'); }
+
+/** Render the four latency boxes; values may be null (shown as em-dash). */
+function setMetrics(stt, ttfa, tts, total) {
+  const fmt = (x) => x == null ? '—' : `${Math.round(x)} ms`;
+  $('m-stt').textContent = fmt(stt);
+  $('m-ttfa').textContent = fmt(ttfa);
+  $('m-tts').textContent = fmt(tts);
+  $('m-total').textContent = fmt(total);
+}
+
+/** Transformers.js download progress -> status text ("Loading model.bin 42%"). */
+function progress() {
+  return (p) => {
+    if (!p) return;
+    const pct = p.progress !== undefined ? Math.round(p.progress) : null;
+    setLoading(pct != null ? `Loading ${p.file || ''} ${pct}%` : `Loading ${p.file || ''}`);
+  };
+}
+
+/* ==========================================================================
+   2. Audio player — resamples model audio to the AudioContext rate and
+      schedules buffers gaplessly (each source starts where the last ends).
+   ========================================================================== */
+
+/** Linear-interpolation resampler; good enough quality for speech at low cost. */
+function resample(samples, fromRate, toRate) {
+  if (fromRate === toRate) return samples.slice();
+  const ratio = fromRate / toRate;
+  const out = new Float32Array(Math.round(samples.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const pos = i * ratio;
+    const idx = pos | 0;
+    const frac = pos - idx;
+    const a = samples[idx];
+    const b = samples[idx + 1 < samples.length ? idx + 1 : idx];
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
+class Player {
+  constructor() {
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this.gain = this.ctx.createGain();
+    this.gain.connect(this.ctx.destination);
+    this.gain.gain.value = S.settings.volume;
+    this.sources = [];
+    this.nextTime = null;   // End time of the last scheduled buffer.
+  }
+  /** Must be called from a user gesture (click) to satisfy autoplay policy. */
+  async resume() { if (this.ctx.state !== 'running') await this.ctx.resume(); }
+  setVolume(v) { this.gain.gain.value = v; }
+  /** Append one chunk of PCM samples (at `fromRate` Hz) to the play queue. */
+  enqueue(samples, fromRate) {
+    const out = resample(samples, fromRate, this.ctx.sampleRate);
+    const buf = this.ctx.createBuffer(1, out.length, this.ctx.sampleRate);
+    buf.getChannelData(0).set(out);
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(this.gain);
+    // Schedule immediately, or back-to-back after whatever is already queued.
+    const now = this.ctx.currentTime;
+    const start = (this.nextTime != null && this.nextTime > now) ? this.nextTime : now;
+    src.start(start);
+    this.nextTime = start + buf.duration;
+    this.sources.push(src);
+  }
+  /** Stop everything now (barge-in / shutdown). Clears the schedule. */
+  stop() {
+    for (const s of this.sources) { try { s.stop(); } catch (e) {} }
+    this.sources = [];
+    this.nextTime = null;
+  }
+}
+
+/* ==========================================================================
+   3. Model loading — WebGPU detection first, then STT and TTS pipelines.
+   ========================================================================== */
+
+/** Probe for a usable GPU adapter; falls back to WASM/q8 with the reason logged. */
+async function detectBackend() {
+  let reason = '';
+  try {
+    if (navigator.gpu) {
+      let adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      if (!adapter) adapter = await navigator.gpu.requestAdapter();
+      if (adapter) { S.device = 'webgpu'; S.dtype = 'fp32'; return; }
+      reason = 'requestAdapter() returned null';
+    } else {
+      reason = 'navigator.gpu missing (WebGPU not supported/enabled in this browser)';
+    }
+  } catch (e) {
+    reason = 'requestAdapter() error: ' + (e && e.message ? e.message : e);
+  }
+  S.device = 'wasm'; S.dtype = 'q8';
+  console.warn('[backend] WebGPU unavailable:', reason, '-> WASM fallback');
+}
+
+/** Load Whisper (STT) + Kokoro (TTS), then populate the voice dropdown. */
+async function loadModels() {
+  setLoading('Detecting WebGPU…');
+  await detectBackend();
+  $('backend-label').textContent = 'Backend: ' +
+    (S.device === 'webgpu' ? 'WebGPU (GPU)' : 'WASM (CPU fallback — slower, needs WebGPU for best latency)');
+  setLoading('Loading Whisper (STT)…');
+  S.transcriber = await pipeline('automatic-speech-recognition', 'onnx-community/whisper-base', {
+    device: S.device, dtype: S.dtype, progress_callback: progress(),
+  });
+  setLoading('Loading Kokoro (TTS)…');
+  S.tts = await KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', {
+    device: S.device, dtype: S.dtype, progress_callback: progress(),
+  });
+  fillVoices();
+}
+
+/** Populate the voice <select> once Kokoro exposes its voice catalog. */
+function fillVoices() {
+  const sel = $('voice');
+  const voices = S.tts.voices || {};
+  sel.innerHTML = '';
+  for (const [id, meta] of Object.entries(voices)) {
+    const o = document.createElement('option');
+    o.value = id;
+    o.textContent = `${id} — ${meta?.name || ''} (${meta?.language || ''})`;
+    if (id === S.settings.voice) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+
+/* ==========================================================================
+   4. VAD wiring — turns raw mic frames into utterance events.
+   ========================================================================== */
+
+/**
+ * Convert the silence slider (ms) into VAD "redemption frames".
+ * vad-web counts frames of 1536 samples @ 16 kHz = 96 ms each.
+ */
+function silenceToFrames(ms) {
+  return Math.max(1, Math.round(ms / 96));
+}
+
+/**
+ * Create and start the mic-VAD loop. Destroyed/recreated on restart or when
+ * the silence-duration setting changes.
+ */
+async function startVAD() {
+  if (S.vad) { try { S.vad.destroy(); } catch (e) {} S.vad = null; }
+  S.vad = await vad.MicVAD.new({
+    // vad-web defaults these to "./" (page origin), which 404s. Point at CDN.
+    baseAssetPath: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/',
+    onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
+    positiveSpeechThreshold: 0.5,
+    negativeSpeechThreshold: 0.35,
+    redemptionFrames: silenceToFrames(S.settings.silenceMs),
+    preSpeechPadFrames: 1,
+    minSpeechFrames: 3,
+    onSpeechStart: () => {
+      S.runId++;                    // Barge-in: invalidate any in-flight STT/TTS.
+      if (S.player) S.player.stop();
+      setStatus('LISTENING', 'listening');
+    },
+    onSpeechEnd: (audio) => { handleUtterance(audio); },
+  });
+  await S.vad.start();
+}
+
+/* ==========================================================================
+   5. Pipeline — one completed utterance: transcribe, then speak it back.
+      Every await is followed by a runId check so stale results (from before
+      a barge-in or stop) are silently dropped instead of double-speaking.
+   ========================================================================== */
+
+async function handleUtterance(audio) {
+  const runId = S.runId;
+  setStatus('TRANSCRIBING', 'working');
+  const tEnd = performance.now();
+
+  // --- STT ---
+  const sttStart = performance.now();
+  let text = '';
+  try {
+    const res = await S.transcriber(audio, { language: 'en', task: 'transcribe' });
+    text = (res.text || '').trim();
+  } catch (e) {
+    console.error('STT failed', e);
+    setStatus('ERROR', 'error');
+    return;
+  }
+  const sttMs = performance.now() - sttStart;
+  if (runId !== S.runId) return;                    // Superseded mid-transcribe.
+
+  // Empty transcript: tell the user instead of going silent.
+  if (!text) {
+    const el = $('transcript');
+    el.textContent = '(nothing heard)';
+    el.classList.add('nothing');
+    setTimeout(() => el.classList.remove('nothing'), 1500);
+    setStatus('READY', 'ready');
+    return;
+  }
+
+  $('transcript').textContent = text;
+
+  await speak(text, runId, tEnd, sttMs);
+}
+
+/** Stream `text` through Kokoro sentence-by-sentence into the Player. */
+async function speak(text, runId, speechEndTime, sttMs) {
+  setStatus('SPEAKING', 'working');
+  if (!S.player) S.player = new Player();
+  await S.player.resume();
+
+  const ttsStart = performance.now();
+  let ttfaMs = null;                                // Time to first audible chunk.
+
+  const splitter = new TextSplitterStream();
+  splitter.push(text);
+  splitter.close();
+
+  try {
+    for await (const { audio } of S.tts.stream(splitter, {
+      voice: S.settings.voice,
+      speed: S.settings.speed,
+    })) {
+      if (runId !== S.runId) break;                 // Barge-in.
+      if (ttfaMs == null) ttfaMs = performance.now() - ttsStart;
+      S.player.enqueue(audio.audio, audio.sampling_rate);
+    }
+  } catch (e) {
+    console.error('TTS failed', e);
+    setStatus('ERROR', 'error');
+    return;
+  }
+  if (runId !== S.runId) return;                    // Superseded mid-playback.
+
+  const ttsMs = performance.now() - ttsStart;
+  const totalMs = performance.now() - speechEndTime;
+  setMetrics(sttMs, ttfaMs, ttsMs, totalMs);
+  setStatus('READY', 'ready');
+}
+
+/* ==========================================================================
+   6. Event wiring — start/stop toggle, settings inputs, TTS test bench.
+   ========================================================================== */
+
+$('mic').addEventListener('click', async () => {
+  const btn = $('mic');
+
+  if (!S.started) {
+    btn.disabled = true;
+    try {
+      // Create/resume the AudioContext during THIS click gesture; autoplay
+      // policy would leave it suspended if created after a long model-load
+      // await. Cheap no-op if a player already exists (restart path).
+      if (!S.player) S.player = new Player();
+      await S.player.resume();
+
+      // Load models only once — restarts reuse the already-loaded pipelines.
+      if (!S.transcriber || !S.tts) {
+        await loadModels();
+      } else {
+        setLoading('RECONNECTING');
+      }
+      await startVAD();
+
+      S.started = true;
+      btn.textContent = '●';
+      btn.classList.add('active');
+      setStatus('READY', 'ready');
+    } catch (e) {
+      console.error(e);
+      btn.disabled = false;
+      setStatus('ERROR', 'error');
+      $('transcript').textContent = 'Failed to start: ' + (e && e.message ? e.message : e);
+    }
+  } else {
+    // Stop: invalidate all in-flight work, kill VAD, halt playback.
+    S.runId++;
+    if (S.vad) { try { S.vad.destroy(); } catch (e) {} S.vad = null; }
+    if (S.player) S.player.stop();
+    S.started = false;
+    btn.textContent = '▶';
+    btn.classList.remove('active');
+    setStatus('OFFLINE', '');
+  }
+});
+
+// --- Settings inputs --------------------------------------------------------
+
+// Voice picker feeds straight into the next speak() call.
+$('voice').addEventListener('change', (e) => { S.settings.voice = e.target.value; });
+
+// Playback speed (Kokoro param).
+$('speed').addEventListener('input', (e) => {
+  S.settings.speed = parseFloat(e.target.value);
+  $('speed-val').textContent = S.settings.speed.toFixed(1);
+});
+
+// Output gain applied both live and via Player default.
+$('volume').addEventListener('input', (e) => {
+  S.settings.volume = parseInt(e.target.value, 10) / 100;
+  $('volume-val').textContent = e.target.value + '%';
+  if (S.player) S.player.setVolume(S.settings.volume);
+});
+
+// End-of-speech timeout; recreating the VAD picks up the new setting.
+$('silence').addEventListener('input', (e) => {
+  S.settings.silenceMs = parseInt(e.target.value, 10);
+  $('silence-val').textContent = S.settings.silenceMs + ' ms';
+  if (S.started) startVAD();
+});
+
+// Typed-text TTS test bench (does not touch the transcript or VAD state).
+$('test-btn').addEventListener('click', async () => {
+  const t = $('test-text').value.trim();
+  if (!t || !S.tts) return;
+  S.runId++;                       // Cancel anything currently playing.
+  if (S.player) S.player.stop();
+  await speak(t, S.runId, performance.now(), null);
+});
+</script>
+</body>
+</html>
