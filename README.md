@@ -134,6 +134,10 @@ redistributed in this repository. Still, credit where it's due:
 > despite the MIT library code. If this project ever goes commercial,
 > swap VAD or obtain a license from the Silero Team.
 
+### Special thanks
+
+- **Matrix** 💚 — for the support and inspiration.
+
 ## License
 
 Released under the [MIT License](LICENSE) — © 2026 Trifocals7733.
