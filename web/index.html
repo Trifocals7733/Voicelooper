@@ -379,7 +379,7 @@ async function loadModels() {
   $('backend-label').textContent = 'Backend: ' +
     (S.device === 'webgpu' ? 'WebGPU (GPU)' : 'WASM (CPU fallback — slower, needs WebGPU for best latency)');
   setLoading('Loading Whisper (STT)…');
-  S.transcriber = await pipeline('automatic-speech-recognition', 'onnx-community/whisper-base', {
+  S.transcriber = await pipeline('automatic-speech-recognition', 'moondream/parakeet-redux', {
     device: S.device, dtype: S.dtype, progress_callback: progress(),
   });
   setLoading('Loading Kokoro (TTS)…');

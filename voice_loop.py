@@ -76,7 +76,7 @@ TTS_SAMPLE_RATE = 24_000    # Hz - native sample rate of Kokoro output audio.
 TTS_VOLUME = 0.3            # Output gain multiplier.
 
 # --- Whisper STT ------------------------------------------------------------------
-WHISPER_MODEL_NAME = "distil-large-v3"
+WHISPER_MODEL_NAME = "moondream/parakeet-redux"
 WHISPER_LANGUAGE = "en"
 
 
